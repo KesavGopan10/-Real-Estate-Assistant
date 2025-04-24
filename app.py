@@ -4,406 +4,365 @@ import numpy as np
 import datetime
 import os
 import json
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict, Any
 import asyncio
-import nest_asyncio
 from streamlit.runtime.scriptrunner import add_script_run_ctx
 import google.generativeai as genai
 import base64
 from io import BytesIO
+from dotenv import load_dotenv
 
-# Apply nest_asyncio to allow nested event loops
-nest_asyncio.apply()
-
-# Load environment variables
+# --- Environment Variable Loading ---
 def load_env_file():
-    """Load environment variables from .env file if it exists"""
-    env_path = ".env"
-    if os.path.exists(env_path):
-        with open(env_path, "r") as f:
-            for line in f:
-                if line.strip() and not line.startswith("#"):
-                    key, value = line.strip().split("=", 1)
-                    os.environ[key] = value
+    load_dotenv()
     return os.environ.get("GOOGLE_API_KEY", "")
 
+# --- Gemini Service ---
 class GeminiService:
-    """
-    Class for generating responses using Gemini API with vision support.
-    """
-
     def __init__(self, api_key: str):
-        """Initialize Gemini client with API key"""
         genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel("gemini-1.5-pro")  # Supports text + images
+        self.model = genai.GenerativeModel("gemini-1.5-pro")
 
-    async def generate_response(self, prompt: str, image_data: Optional[np.ndarray] = None) -> str:
-        """
-        Generate response using Gemini API.
-
-        Args:
-            prompt (str): The prompt to send to the AI
-            image_data (Optional[np.ndarray]): Image data if available
-
-        Returns:
-            str: AI response
-        """
-        try:
-            # Prepare content for Gemini
-            content = [{"text": prompt}]
+    def _convert_st_history_to_gemini(self, chat_history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        gemini_history = []
+        for message in chat_history:
+            role = "user" if message["role"] == "user" else "model"
+            parts = []
             
-            if image_data is not None:
-                # Convert numpy array to PIL Image
-                image = Image.fromarray(image_data)
-                
-                # Convert PIL Image to base64-encoded string
-                buffered = BytesIO()
-                image_format = image.format if image.format else "JPEG"
-                image.save(buffered, format=image_format)
-                img_bytes = buffered.getvalue()
-                img_base64 = base64.b64encode(img_bytes).decode("utf-8")
-                
-                # Determine MIME type
-                mime_type = f"image/{image_format.lower()}"
-                
-                # Add image part to content
-                content.append({
-                    "inline_data": {
-                        "mime_type": mime_type,
-                        "data": img_base64
-                    }
-                })
+            if message.get("content"):
+                parts.append({"text": message["content"]})
 
-            # Generate content using Gemini
+            if message["role"] == "user" and message.get("image_data") is not None:
+                image_data = message["image_data"]
+                try:
+                    image = Image.fromarray(image_data)
+                    max_size = (1024, 1024)
+                    image.thumbnail(max_size, Image.Resampling.LANCZOS)
+                    buffered = BytesIO()
+                    img_format = image.format if image.format else "JPEG"
+                    image.save(buffered, format=img_format, quality=85)
+                    img_bytes = buffered.getvalue()
+                    if len(img_bytes) > 4 * 1024 * 1024:
+                        raise ValueError("Image size too large for API")
+                    img_base64 = base64.b64encode(img_bytes).decode("utf-8")
+                    mime_type = f"image/{img_format.lower()}"
+                    parts.append({
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": img_base64
+                        }
+                    })
+                except Exception as e:
+                    st.error(f"Error processing image: {e}")
+                    parts.append({"text": "[Image processing failed]"})
+
+            if parts:
+                gemini_history.append({"role": role, "parts": parts})
+
+        return gemini_history
+
+    async def generate_response_with_history(self, system_prompt: str, chat_history: List[Dict[str, Any]]) -> str:
+        try:
+            gemini_history = self._convert_st_history_to_gemini(chat_history)
+            chat = self.model.start_chat(history=gemini_history[:-1])
+            last_user_message_parts = gemini_history[-1]['parts']
             response = await asyncio.to_thread(
-                self.model.generate_content,
-                content,
-                generation_config={
-                    "temperature": 0.7,
-                }
+                chat.send_message,
+                last_user_message_parts,
+                generation_config={"temperature": 0.7}
             )
-
+            if not response.text:
+                raise ValueError("Empty response from Gemini API")
             return response.text
-
         except Exception as e:
-            raise RuntimeError(f"Error with Gemini API request: {e}")
+            st.warning(f"Error using chat history: {e}. Falling back to single-turn generation.")
+            try:
+                if not chat_history or not chat_history[-1].get("content"):
+                    raise ValueError("No valid user input to process")
+                last_message = chat_history[-1]
+                prompt = system_prompt + "\n\n" + last_message.get("content", "")
+                image_data = last_message.get("image_data")
+                content = [{"text": prompt}]
+                if image_data is not None:
+                    image = Image.fromarray(image_data)
+                    buffered = BytesIO()
+                    img_format = image.format if image.format else "JPEG"
+                    image.save(buffered, format=img_format, quality=85)
+                    img_bytes = buffered.getvalue()
+                    img_base64 = base64.b64encode(img_bytes).decode("utf-8")
+                    mime_type = f"image/{img_format.lower()}"
+                    content.append({
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": img_base64
+                        }
+                    })
+                response = await asyncio.to_thread(
+                    self.model.generate_content,
+                    content,
+                    generation_config={"temperature": 0.7}
+                )
+                if not response.text:
+                    raise ValueError("Empty response from Gemini API")
+                return response.text
+            except Exception as fallback_e:
+                raise RuntimeError(f"Error with Gemini API request: {fallback_e}")
 
-# Async helper for generating responses
+# --- Agent Logic ---
 async def generate_agent_response(gemini_service: GeminiService, agent_type: str,
-                                 text_input: str, image_data: Optional[np.ndarray] = None,
-                                 location: Optional[str] = None) -> Tuple[str, bool]:
-    """
-    Generate a response using the appropriate agent via the Gemini service.
+                                 chat_history: List[Dict[str, Any]], location: Optional[str] = None) -> Tuple[str, bool]:
+    last_message = chat_history[-1]
+    text_input = last_message.get("content", "")
+    has_image = last_message.get("image_data") is not None
 
-    Args:
-        gemini_service (GeminiService): The Gemini service to use
-        agent_type (str): Type of agent ("property_issue" or "tenancy_faq")
-        text_input (str): User's text input
-        image_data (Optional[np.ndarray]): Image data if available
-        location (Optional[str]): User's location if available
+    property_issue_prompt = """
+Role: You are a smart real estate diagnostics assistant specializing in analyzing property issues using images and text. Use conversation history for context. Identify problems and provide practical troubleshooting advice. Ask follow-up questions if needed.
+Capabilities:
+- Analyze images and text for issues (e.g., water stains, mold, cracks).
+- Provide actionable troubleshooting steps.
+- Ask relevant follow-up questions.
+Response Format:
+1. Acknowledge input.
+2. Diagnosis: State potential issue(s).
+3. Explanation: Explain causes.
+4. Suggestions: Offer 1-3 steps.
+5. Follow-up Question: Ask for more info if needed.
+Tone: Friendly, clear, concise.
+"""
 
-    Returns:
-        Tuple[str, bool]: (Response, whether location is needed)
-    """
-    # Check for location requirement for tenancy questions
+    tenancy_faq_prompt = f"""
+Role: You are a real estate legal assistant specializing in tenancy questions. Use conversation history for context. Provide concise, location-aware answers (location: {location if location else 'Not specified'}). Ask for location if needed.
+Capabilities:
+- Answer tenancy FAQs (rent, leases, rights).
+- Adapt to location if provided.
+- Explain in plain language.
+- Advise consulting local authorities for specifics.
+Response Format:
+1. Address the question.
+2. Provide general or location-specific info.
+3. Ask for location if needed.
+4. Suggest next steps.
+Tone: Supportive, clear, professional.
+"""
+
+    unclear_prompt = """
+Role: You are a real estate assistant. The request is unclear.
+Task: Ask for clarification.
+1. Acknowledge message.
+2. Ask if they need help with:
+   a) Property issues (offer photo upload).
+   b) Tenancy questions.
+Tone: Concise, friendly.
+"""
+
+    needs_location = False
     if agent_type == "tenancy_faq":
-        location_dependent_keywords = ["notice", "deposit", "evict", "legal", "right", "law", "return", "withhold"]
-        needs_location = any(keyword in text_input.lower() for keyword in location_dependent_keywords)
+        location_dependent_keywords = ["notice", "deposit", "evict", "legal", "right", "law", "return", "withhold", "enter", "increase rent", "break lease"]
+        if any(keyword in text_input.lower() for keyword in location_dependent_keywords) and not location:
+            needs_location = True
+            tenancy_faq_prompt += "\n\nIMPORTANT: Since location is needed and not provided, ask for city/state or country."
 
-        if needs_location and not location:
-            return "To give you the most accurate information about tenancy laws, I need to know your location (city/state or country). Laws vary significantly by jurisdiction.", True
+    system_prompt = {
+        "property_issue": property_issue_prompt,
+        "tenancy_faq": tenancy_faq_prompt,
+        "unclear": unclear_prompt
+    }.get(agent_type, unclear_prompt)
 
-    # Create the appropriate prompt based on agent type
-    if agent_type == "property_issue":
-        prompt = f"""
-Role:
-You are a smart and helpful real estate diagnostics assistant that specializes in analyzing property-related issues using both images and text. Your main goal is to identify potential problems in a house or property from visual evidence and provide practical troubleshooting advice. You may ask follow-up questions to gather more details and improve your recommendations.
+    response = await gemini_service.generate_response_with_history(system_prompt, chat_history)
+    return response, needs_location
 
-Capabilities:
-
-Accepts user-uploaded property images and optional textual descriptions or questions.
-
-Detects and identifies visible issues in images (e.g., water stains, mold, cracks, lighting problems, broken fixtures).
-
-Gives actionable troubleshooting suggestions that a homeowner or real estate agent can follow.
-
-Asks clear and helpful follow-up questions if the image is unclear or if additional context is needed to make a better diagnosis.
-
-Response Format:
-
-Begin with a diagnosis: What issue you see in the image and where it appears.
-
-Provide a brief explanation of what might be causing the issue.
-
-Offer at least one or two practical suggestions (e.g., who to contact, what product to use).
-
-End with a follow-up question, if more information is needed.
-
-Tone:
-Friendly, informative, and supportive. Speak in plain language that a typical homeowner or real estate buyer/seller would understand.
-
-Example Interaction:
-
-User: “What’s wrong with this wall?” (uploads image)
-Agent:
-“It looks like there’s mold growth in the upper corner of the wall. This could be due to poor ventilation or a water leak from the ceiling.
-I suggest inspecting for roof leaks and using an anti-mold treatment. A dehumidifier might also help reduce moisture.
-Can you tell me if this room tends to feel damp or if you’ve noticed any recent water leaks?”
-
-
-
-{'The user has provided an image of a property issue. Please analyze the image for visible issues.' if image_data is not None else ''}
-
-User description: {text_input if text_input else 'No description provided.'}
-
-"""
-    elif agent_type == "tenancy_faq":
-        prompt = f"""
-Role:
-You are a knowledgeable and reliable real estate legal assistant specializing in tenancy-related questions. You help users understand rental laws, lease agreements, tenant and landlord rights, and rental processes. Your answers should be informative, concise, and location-aware when the user provides geographic details.
-
-Capabilities:
-
-Answers frequently asked questions about tenancy laws, rental contracts, and tenant/landlord responsibilities.
-
-Adjusts answers based on the user’s location (e.g., country, state, or city), if provided.
-
-Gives clear, plain-language explanations suitable for non-lawyers.
-
-Provides general guidance and encourages users to consult local authorities or legal professionals when needed.
-
-Politely prompts for more details if the question is too broad or lacks location context.
-
-Response Format:
-
-Start with a direct and clear answer to the question.
-
-Add context or conditions (e.g., "In most places..." or "This varies by location...").
-
-Offer guidance on next steps (e.g., "You may want to contact a local tenancy board.").
-
-Ask for the user's location if it helps tailor the response.
-
-Tone:
-Supportive, clear, and respectful. Speak like a helpful government agency rep or legal advisor who's good at explaining things simply.
-
-Example Interaction:
-
-User: “Can my landlord evict me without notice?”
-Agent:
-“In most places, a landlord cannot evict a tenant without proper notice. The exact notice period depends on your location and the reason for eviction.
-For example, in many U.S. states, non-payment of rent requires at least 3–5 days’ notice.
-Could you let me know what city or country you're in? I can provide more specific information based on local laws.”
-User question: {text_input}
-User location: {location if location else 'Not specified'}
-
-
-"""
-    else:  # unclear route
-        prompt = f"""
-You are a real estate assistant. The user has sent a message that could be about a property issue or a tenancy question.
-
-User message: {text_input}
-
-Please:
-1. Ask if they're inquiring about a property maintenance issue or a tenancy/legal question
-2. Briefly explain what kind of help you can provide for each category
-3. Be concise and helpful
-"""
-
-    # Generate the response using the service
-    response = await gemini_service.generate_response(prompt, image_data)
-
-    # Return the response and whether location is needed
-    return response, agent_type == "tenancy_faq" and needs_location and not location
-
-# Streamlit app
+# --- Streamlit App ---
 async def main():
-    # Set page configuration
-    st.set_page_config(
-        page_title="Real Estate Assistant",
-        page_icon="🏠",
-        layout="wide"
-    )
+    st.set_page_config(page_title="Real Estate Assistant", page_icon="🏠", layout="wide")
 
-    # Initialize session state variables if they don't exist
+    # Initialize Session State
     if 'chat_history' not in st.session_state:
         st.session_state.chat_history = []
     if 'user_location' not in st.session_state:
         st.session_state.user_location = None
     if 'current_agent' not in st.session_state:
-        st.session_state.current_agent = None
+        st.session_state.current_agent = "unclear"
     if 'waiting_for_location' not in st.session_state:
         st.session_state.waiting_for_location = False
     if 'api_key' not in st.session_state:
         st.session_state.api_key = load_env_file()
+    if 'pending_image_data' not in st.session_state:
+        st.session_state.pending_image_data = None
+    if 'pending_image_name' not in st.session_state:
+        st.session_state.pending_image_name = None
 
-    # Title and description with colorful UI
-    st.markdown(
-        """
-        <h1 style='color: #4CAF50;'>🏠 Real Estate Assistant</h1>
-        <p style='color: #555;'>Get help with property issues or tenancy questions.</p>
-        """,
-        unsafe_allow_html=True
-    )
+    # Limit chat history
+    max_history_length = 20
+    if len(st.session_state.chat_history) > max_history_length:
+        st.session_state.chat_history = st.session_state.chat_history[-max_history_length:]
 
-    # Sidebar for settings and chat type selection
+    # UI Elements
+    st.markdown("<h1 style='color: #4CAF50;'>🏠 Real Estate Assistant</h1>", unsafe_allow_html=True)
+    st.markdown("<p style='color: #555;'>Your AI helper for property issues and tenancy questions.</p>", unsafe_allow_html=True)
+
+    # Sidebar
     with st.sidebar:
         st.markdown("<h2 style='color: #4CAF50;'>Settings</h2>", unsafe_allow_html=True)
-
-        # API key input
         api_key = st.text_input(
-            "Google API Key",
-            type="password",
-            value=st.session_state.api_key,
+            "Google API Key", type="password", value=st.session_state.api_key,
             help="Enter your Google API key or set it in .env file as GOOGLE_API_KEY"
         )
-
-        # Save API key to session state when changed
         if api_key != st.session_state.api_key:
             st.session_state.api_key = api_key
 
-        st.markdown("<h2 style='color: #4CAF50;'>Choose Assistance Type</h2>", unsafe_allow_html=True)
-        assistance_type = st.radio(
-            "What do you need help with?",
-            ["Let the assistant decide", "Property Issue", "Tenancy Question"]
+        st.markdown("<h2 style='color: #4CAF50;'>Assistant Mode</h2>", unsafe_allow_html=True)
+        agent_options = ["Let Assistant Decide", "Property Issue", "Tenancy Question"]
+        agent_map = {"property_issue": 1, "tenancy_faq": 2, "unclear": 0}
+        default_index = agent_map.get(st.session_state.current_agent, 0)
+        selected_agent_mode = st.radio(
+            "Manually select assistance type:",
+            agent_options,
+            index=default_index
         )
+        if selected_agent_mode == "Property Issue":
+            st.session_state.current_agent = "property_issue"
+        elif selected_agent_mode == "Tenancy Question":
+            st.session_state.current_agent = "tenancy_faq"
+        else:
+            pass
 
         st.markdown("---")
-        st.markdown("### About this Assistant")
-        st.markdown("""
-        This assistant can help with:
-        - 🔍 Property issue analysis (upload an image or describe the problem)
-        - 📝 Tenancy questions and legal information
+        st.info("Your chat history provides context for follow-up questions.")
+        if st.button("Clear Chat History"):
+            st.session_state.chat_history = []
+            st.session_state.current_agent = "unclear"
+            st.session_state.user_location = None
+            st.session_state.waiting_for_location = False
+            st.session_state.pending_image_data = None
+            st.session_state.pending_image_name = None
+            st.rerun()
 
-        Your chat history is only stored for this session.
-        """)
+    # Main Chat Area
+    uploaded_file = st.file_uploader(
+        "Upload Property Image (Optional - then describe below)",
+        type=["jpg", "jpeg", "png"],
+        key=f"file_uploader_{len(st.session_state.chat_history)}"
+    )
 
-    # Main chat interface
-    st.markdown("<h2 style='color: #4CAF50;'>Chat</h2>", unsafe_allow_html=True)
-
-    # Display chat history
-    for message in st.session_state.chat_history:
-        if message["role"] == "user":
-            st.chat_message("user").write(message["content"])
-            if "image" in message and message["image"] is not None:
-                st.chat_message("user").image(message["image"], caption="Uploaded Image")
-        else:
-            st.chat_message("assistant").write(message["content"])
-
-    # Handle user input
-    user_input = st.chat_input("Type your message here...")
-    col1, col2 = st.columns([3, 1])
-
-    with col1:
-        uploaded_file = st.file_uploader("Upload an image of the property issue (optional)",
-                                        type=["jpg", "jpeg", "png"])
-
-    # Process the user input
-    if user_input or uploaded_file:
-        # Validate API key
-        if not st.session_state.api_key:
-            st.error("Please provide a Google API key in the sidebar or set it in .env file as GOOGLE_API_KEY.")
-            return
-
-        # Process uploaded image
-        image_data = None
-        if uploaded_file:
-            # Convert uploaded image to a format we can use
+    if uploaded_file is not None:
+        try:
             image = Image.open(uploaded_file)
+            max_size = (1024, 1024)
+            image.thumbnail(max_size, Image.Resampling.LANCZOS)
             image_array = np.array(image)
-            image_data = image_array
+            st.session_state.pending_image_data = image_array
+            st.session_state.pending_image_name = uploaded_file.name
+            st.success(f"🖼️ Image '{uploaded_file.name}' ready. Add description below and send.")
+            st.image(image, caption=f"Ready to send: {uploaded_file.name}", width=300)
+        except Exception as e:
+            st.error(f"Error processing image: {e}")
+            st.session_state.pending_image_data = None
+            st.session_state.pending_image_name = None
 
-            # Add to chat history (only store the fact that an image was uploaded)
-            st.chat_message("user").write(user_input if user_input else "I have a property issue (image uploaded)")
-            st.chat_message("user").image(image, caption="Uploaded Image")
-            image_indicator = True
-        else:
-            image_indicator = False
-            st.chat_message("user").write(user_input)
+    # Chat History
+    st.markdown("<h2 style='color: #4CAF50;'>Chat</h2>", unsafe_allow_html=True)
+    chat_container = st.container()
+    with chat_container:
+        for message in st.session_state.chat_history:
+            with st.chat_message(message["role"]):
+                if message.get("content"):
+                    st.write(message["content"])
+                if message.get("image_data") is not None:
+                    try:
+                        image = Image.fromarray(message["image_data"])
+                        st.image(image, width=300, caption="Uploaded Image")
+                    except Exception as e:
+                        st.error(f"Error displaying image: {e}")
 
-        # Add user message to history
-        st.session_state.chat_history.append({
+    # Chat Input
+    user_input = st.chat_input(
+        "Describe the issue or ask your question here...",
+        disabled=not st.session_state.api_key
+    )
+    if not st.session_state.api_key and user_input is None:
+        st.error("⚠️ Please provide a Google API key in the sidebar settings.")
+
+    # Handle User Input
+    if user_input:
+        if not st.session_state.api_key:
+            st.error("⚠️ Please provide a Google API key in the sidebar settings.")
+            st.stop()
+
+        current_message = {
             "role": "user",
-            "content": user_input if user_input else "I have a property issue (image uploaded)",
-            "image": image_data if image_indicator else None,
-            "timestamp": datetime.datetime.now()
-        })
+            "content": user_input,
+            "timestamp": datetime.datetime.now(),
+            "image_data": st.session_state.pending_image_data
+        }
+        st.session_state.chat_history.append(current_message)
+        st.session_state.pending_image_data = None
+        st.session_state.pending_image_name = None
 
-        # Create the Gemini service
         try:
             gemini_service = GeminiService(st.session_state.api_key)
         except Exception as e:
             st.error(f"Error initializing Gemini service: {e}")
-            return
+            st.stop()
 
-        # Use a loading indicator while waiting for AI response
         with st.spinner("Thinking..."):
-            # If we were waiting for location, handle that specially
-            if st.session_state.waiting_for_location:
-                st.session_state.waiting_for_location = False
-                st.session_state.user_location = user_input
-
-                # Get previous question from history
-                prev_question = st.session_state.chat_history[-2]["content"]
-
-                # Generate response with location
-                response, need_location = await generate_agent_response(
-                    gemini_service,
-                    "tenancy_faq",
-                    prev_question,
-                    None,
-                    user_input
-                )
-                agent_type = "tenancy_faq"
+            mode_from_sidebar = st.session_state.current_agent
+            if mode_from_sidebar in ["property_issue", "tenancy_faq"]:
+                agent_type_to_use = mode_from_sidebar
+            elif st.session_state.current_agent in ["property_issue", "tenancy_faq"] and len(st.session_state.chat_history) > 1:
+                agent_type_to_use = st.session_state.current_agent
             else:
-                # Determine which agent to use based on user selection or auto-routing
-                if assistance_type == "Property Issue":
-                    agent_type = "property_issue"
-                elif assistance_type == "Tenancy Question":
-                    agent_type = "tenancy_faq"
-                else:  # Let the assistant decide
-                    # Simple routing logic
-                    if uploaded_file is not None:
-                        agent_type = "property_issue"
-                    elif any(keyword in user_input.lower() for keyword in ["lease", "rent", "evict", "deposit", "notice", "legal"]):
-                        agent_type = "tenancy_faq"
-                    elif any(keyword in user_input.lower() for keyword in ["mold", "leak", "damage", "broken", "toilet", "water"]):
-                        agent_type = "property_issue"
-                    else:
-                        agent_type = "unclear"
+                has_image = current_message.get("image_data") is not None
+                text_content = current_message.get("content", "").lower()
+                property_keywords = ["mold", "leak", "damage", "broken", "fix", "repair", "water", "crack", "pest", "paint"]
+                tenancy_keywords = ["lease", "rent", "evict", "deposit", "notice", "legal", "tenant", "landlord", "agreement", "rights"]
+                property_score = sum(1 for keyword in property_keywords if keyword in text_content) + (5 if has_image else 0)
+                tenancy_score = sum(1 for keyword in tenancy_keywords if keyword in text_content)
+                if property_score > tenancy_score:
+                    agent_type_to_use = "property_issue"
+                elif tenancy_score > 0:
+                    agent_type_to_use = "tenancy_faq"
+                else:
+                    agent_type_to_use = "unclear"
+            
+            st.session_state.current_agent = agent_type_to_use
 
-                # Generate response with the appropriate agent
-                response, need_location = await generate_agent_response(
+            if st.session_state.waiting_for_location:
+                provided_location = user_input.strip()
+                if any(keyword in provided_location.lower() for keyword in ["city", "state", "country", ",", " "]):
+                    st.session_state.user_location = provided_location
+                    st.session_state.waiting_for_location = False
+                    st.info(f"Location set to: {provided_location}")
+                else:
+                    ai_response = "Please share your city/state or country for accurate tenancy advice, or type 'skip' to continue with general advice."
+                    st.session_state.chat_history.append({
+                        "role": "assistant",
+                        "content": ai_response,
+                        "timestamp": datetime.datetime.now()
+                    })
+                    st.rerun()
+
+            try:
+                ai_response, needs_location_next = await generate_agent_response(
                     gemini_service,
-                    agent_type,
-                    user_input,
-                    image_data,
+                    agent_type_to_use,
+                    st.session_state.chat_history,
                     st.session_state.user_location
                 )
+                st.session_state.waiting_for_location = needs_location_next
+                st.session_state.chat_history.append({
+                    "role": "assistant",
+                    "content": ai_response,
+                    "timestamp": datetime.datetime.now()
+                })
+            except Exception as e:
+                st.error(f"Error generating response: {e}")
+                st.session_state.chat_history.append({
+                    "role": "assistant",
+                    "content": f"Sorry, I encountered an error: {e}",
+                    "timestamp": datetime.datetime.now()
+                })
 
-            # Update session state
-            st.session_state.current_agent = agent_type
-            if need_location:
-                st.session_state.waiting_for_location = True
+        st.rerun()
 
-            # Display assistant response
-            st.chat_message("assistant").write(response)
-
-            # Add assistant response to history
-            st.session_state.chat_history.append({
-                "role": "assistant",
-                "content": response,
-                "timestamp": datetime.datetime.now()
-            })
-
-# Create a new event loop and run the main function
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
-
-# Add the Streamlit script runner context to the loop
-add_script_run_ctx(loop)
-
-# Run the main function
 if __name__ == "__main__":
-    loop.run_until_complete(main())
+    asyncio.run(main())
